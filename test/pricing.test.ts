@@ -3,6 +3,7 @@ import {
   applyDiscount,
   formatCents,
   subtotalCents,
+  taxCents,
   totalCents,
   type LineItem,
 } from '../src/lib/pricing.js';
@@ -76,5 +77,30 @@ describe('formatCents', () => {
 
   it('handles zero', () => {
     expect(formatCents(0)).toBe('$0.00');
+  });
+});
+
+describe('taxCents', () => {
+  it('applies a basis-point rate', () => {
+    expect(taxCents(10000, 825)).toBe(825);
+  });
+
+  it('rounds half-up to the nearest cent', () => {
+    expect(taxCents(10, 500)).toBe(1);
+  });
+
+  it('is 0 at a 0 rate', () => {
+    expect(taxCents(1234, 0)).toBe(0);
+  });
+
+  it('rejects an invalid amount', () => {
+    expect(() => taxCents(-1, 825)).toThrow(RangeError);
+    expect(() => taxCents(1.5, 825)).toThrow(RangeError);
+  });
+
+  it('rejects an out-of-range rate', () => {
+    expect(() => taxCents(100, -1)).toThrow(RangeError);
+    expect(() => taxCents(100, 10001)).toThrow(RangeError);
+    expect(() => taxCents(100, 8.25)).toThrow(RangeError);
   });
 });

@@ -47,3 +47,21 @@ export function formatCents(cents: number): string {
   const abs = Math.abs(cents);
   return `${sign}$${Math.floor(abs / 100)}.${String(abs % 100).padStart(2, '0')}`;
 }
+
+/**
+ * Tax owed on an amount, with the rate in basis points (825 = 8.25%).
+ * Rounds half-up to the nearest cent.
+ */
+export function taxCents(amountCents: number, rateBasisPoints: number): number {
+  if (!Number.isInteger(amountCents) || amountCents < 0) {
+    throw new RangeError(`Invalid amount: ${amountCents}`);
+  }
+  if (
+    !Number.isInteger(rateBasisPoints) ||
+    rateBasisPoints < 0 ||
+    rateBasisPoints > 10000
+  ) {
+    throw new RangeError(`rateBasisPoints out of range: ${rateBasisPoints}`);
+  }
+  return Math.round((amountCents * rateBasisPoints) / 10000);
+}
