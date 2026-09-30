@@ -1,0 +1,355 @@
+name: Deploy to production
+
+# Production deployment gatekeeper.
+#
+# Two layers, and both are needed:
+#
+#   1. `gatekeeper` - the machine preconditions. Runs BEFORE anyone is asked to
+#      approve, and refuses to even request approval for a commit that should
+#      not be deployed. Approval on its own is not a gate: a human clicking
+#      "Approve" cannot tell by eye that a commit skipped QA.
+#
+#   2. `deploy` - the human gate. It declares `environment: production`, and
+#      GitHub suspends the job until a required reviewer approves it. Those
+#      reviewers are a REPOSITORY SETTING, not a file in this repo - run
+#      ./scripts/setup-environments.sh to configure them.
+#
+# The gatekeeper closes the hole named in CLAUDE.md under "Known gaps": nothing
+# previously stopped a hotfix pushed straight to `main` from reaching
+# production without ever being on `test`.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: 'Commit to deploy. Leave blank for the current tip of main. Use this to roll back to a known-good SHA.'
+        required: false
+        default: ''
+      reason:
+        description: 'Why are you deploying this manually? Recorded in the run summary.'
+        required: false
+        default: ''
+      allow_untested:
+        description: 'DANGER: deploy code that never passed through `test`. Emergency hotfix only. You must give a reason.'
+        type: boolean
+        required: false
+        default: false
+
+# One production deploy at a time.
+#
+# cancel-in-progress is FALSE on purpose. A deploy that is half-applied must
+# never be cancelled by the next push, and a run waiting on approval must not be
+# discarded because someone merged again. Runs queue instead.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: read
+  deployments: write
+
+jobs:
+  gatekeeper:
+    name: gatekeeper
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+      short: ${{ steps.resolve.outputs.short }}
+      untested: ${{ steps.provenance.outputs.untested }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ---------------------------------------------------------------- freeze
+      # A deploy freeze is a repository VARIABLE, not a file, so it can be
+      # turned on during an incident without a PR:
+      #   gh variable set DEPLOY_FREEZE --body true  --repo <owner/repo>
+      #   gh variable delete DEPLOY_FREEZE           --repo <owner/repo>
+      #
+      # There is deliberately no override input. If you need to deploy during a
+      # freeze, lift the freeze - that leaves a record of who lifted it.
+      - name: Deploy freeze check
+        env:
+          FREEZE: ${{ vars.DEPLOY_FREEZE }}
+        run: |
+          set -euo pipefail
+          if [ "${FREEZE:-}" = "true" ]; then
+            echo "::error::Production is frozen (repo variable DEPLOY_FREEZE=true). Lift the freeze to deploy."
+            {
+              echo "## Deploy blocked: production is frozen"
+              echo
+              echo 'Lift it with `gh variable delete DEPLOY_FREEZE --repo ${{ github.repository }}`.'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Not frozen."
+
+      # -------------------------------------------------------------- resolve
+      - name: Resolve the commit to deploy
+        id: resolve
+        env:
+          INPUT_SHA: ${{ inputs.sha }}
+        run: |
+          set -euo pipefail
+          if [ -n "${INPUT_SHA:-}" ]; then
+            if ! git cat-file -e "${INPUT_SHA}^{commit}" 2>/dev/null; then
+              echo "::error::'${INPUT_SHA}' is not a commit in this repository."
+              exit 1
+            fi
+            SHA=$(git rev-parse "$INPUT_SHA")
+          else
+            SHA=$(git rev-parse HEAD)
+          fi
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "short=$(git rev-parse --short "$SHA")" >> "$GITHUB_OUTPUT"
+          echo "Deploying $SHA"
+
+      # ------------------------------------------------------------ provenance
+      # The check that matters. Everything reaching production must have been
+      # on `test`, where QA exercised it.
+      #
+      # `test -> main` merges create a merge commit that is NOT itself on
+      # `test`, which is expected and fine. What must not exist is a NON-MERGE
+      # commit reachable from the deploy target but not from `test` - that is
+      # code nobody QA'd.
+      - name: Provenance - everything here passed through `test`
+        id: provenance
+        env:
+          SHA: ${{ steps.resolve.outputs.sha }}
+          ALLOW_UNTESTED: ${{ inputs.allow_untested }}
+          REASON: ${{ inputs.reason }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --quiet origin test || {
+            echo "::error::Cannot fetch origin/test. The promotion chain requires it to exist."
+            exit 1
+          }
+
+          UNTESTED=$(git rev-list --no-merges "$SHA" --not origin/test || true)
+          COUNT=$(printf '%s' "$UNTESTED" | { grep -c . || true; })
+          echo "untested=$COUNT" >> "$GITHUB_OUTPUT"
+
+          if [ "$COUNT" -eq 0 ]; then
+            echo "All commits in this deploy are reachable from origin/test."
+            exit 0
+          fi
+
+          echo "Found $COUNT commit(s) not on origin/test:"
+          git log --no-merges --pretty='  %h %an: %s' "$SHA" --not origin/test
+
+          if [ "${ALLOW_UNTESTED:-false}" = "true" ]; then
+            if [ -z "${REASON:-}" ]; then
+              echo "::error::allow_untested was set but no reason was given. Say why in the 'reason' input."
+              exit 1
+            fi
+            echo "::warning::Deploying $COUNT commit(s) that never passed through 'test'. Override reason: ${REASON}"
+            {
+              echo "## ⚠️ Untested code in this deploy"
+              echo
+              echo "**$COUNT commit(s)** reaching production were never on \`test\`."
+              echo
+              echo "Override reason: ${REASON}"
+              echo
+              git log --no-merges --pretty='- \`%h\` %an: %s' "$SHA" --not origin/test
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          echo "::error::$COUNT commit(s) in this deploy were never on 'test'. Promote through the chain, or re-run with allow_untested and a reason."
+          {
+            echo "## Deploy blocked: untested commits"
+            echo
+            echo "These reached \`main\` without passing through \`test\`:"
+            echo
+            git log --no-merges --pretty='- \`%h\` %an: %s' "$SHA" --not origin/test
+            echo
+            echo "Promote properly, or re-run this workflow with **allow_untested** and a reason."
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 1
+
+      # ------------------------------------------------------------ CI status
+      # Approval must not be requested for a commit whose own CI never passed.
+      # Checks the conclusions recorded against this exact SHA.
+      - name: Required checks passed on this commit
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SHA: ${{ steps.resolve.outputs.sha }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # Job names from ci.yml. Keep in step with the CHECKS list in
+          # scripts/setup-branch-protection.sh.
+          REQUIRED="verify security"
+
+          RUNS=$(gh api "repos/${REPO}/commits/${SHA}/check-runs" --paginate \
+                   --jq '.check_runs[] | "\(.name)=\(.conclusion)"' || true)
+          echo "Check runs on ${SHA}:"
+          printf '%s\n' "$RUNS" | sed 's/^/  /'
+
+          MISSING=""
+          for name in $REQUIRED; do
+            CONCL=$(printf '%s\n' "$RUNS" | { grep "^${name}=" || true; } | head -1 | cut -d= -f2)
+            if [ "$CONCL" != "success" ]; then
+              MISSING="${MISSING} ${name}(${CONCL:-missing})"
+            fi
+          done
+
+          if [ -n "$MISSING" ]; then
+            echo "::error::Required checks did not pass on ${SHA}:${MISSING}"
+            {
+              echo "## Deploy blocked: CI did not pass on this commit"
+              echo
+              echo "Not green on \`${SHA}\`:${MISSING}"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "All required checks are green on this commit."
+
+      # -------------------------------------------------------- what is new
+      # The approver needs to see what they are approving. Diffs against the
+      # last SUCCESSFUL production deployment, which GitHub records because the
+      # deploy job below declares `environment: production`.
+      - name: Build the change manifest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SHA: ${{ steps.resolve.outputs.sha }}
+          SHORT: ${{ steps.resolve.outputs.short }}
+          REPO: ${{ github.repository }}
+          REASON: ${{ inputs.reason }}
+        run: |
+          set -euo pipefail
+          # Newest-first list of past production deployments; take the first
+          # whose latest status is `success`. Nothing found (the very first
+          # deploy, or only failed ones) is handled below.
+          LAST=""
+          DEPLOYMENTS=$(gh api "repos/${REPO}/deployments?environment=production&per_page=50" \
+                          --jq '.[] | "\(.id) \(.sha)"' 2>/dev/null || true)
+          while read -r id sha; do
+            [ -z "${id:-}" ] && continue
+            STATE=$(gh api "repos/${REPO}/deployments/${id}/statuses?per_page=1" \
+                      --jq '.[0].state // empty' 2>/dev/null || true)
+            if [ "$STATE" = "success" ]; then
+              LAST="$sha"
+              break
+            fi
+          done <<< "$DEPLOYMENTS"
+
+          {
+            echo "# Production deploy: \`${SHORT}\`"
+            echo
+            if [ -n "${REASON:-}" ]; then
+              echo "**Reason given:** ${REASON}"
+              echo
+            fi
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Commit | \`${SHA}\` |"
+            echo "| Triggered by | @${{ github.actor }} |"
+            echo "| Event | ${{ github.event_name }} |"
+            echo
+            if [ -n "${LAST:-}" ] && git cat-file -e "${LAST}^{commit}" 2>/dev/null; then
+              AHEAD=$(git rev-list --count "${LAST}..${SHA}" || echo '?')
+              echo "## Changes since the last successful production deploy (\`$(git rev-parse --short "$LAST")\`)"
+              echo
+              echo "${AHEAD} commit(s):"
+              echo
+              git log --no-merges --pretty='- \`%h\` %an: %s' "${LAST}..${SHA}" | head -60
+              echo
+              echo "### Files changed"
+              echo
+              echo '```'
+              git diff --stat "${LAST}" "${SHA}" | tail -30
+              echo '```'
+            else
+              echo "## First recorded production deploy"
+              echo
+              echo "No previous successful production deployment found, so there is"
+              echo "nothing to diff against. Subsequent runs will show a change list."
+            fi
+            echo
+            echo "---"
+            echo
+            echo "### Approver checklist"
+            echo
+            echo "- [ ] The change list above is what you expect to go out"
+            echo "- [ ] QA signed off on these changes on \`test\`"
+            echo "- [ ] You know how to roll this back (re-run this workflow with the previous SHA)"
+            echo "- [ ] Nobody is mid-incident"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Gate summary
+        run: |
+          echo "::notice::Preconditions passed for ${{ steps.resolve.outputs.short }}. Waiting for a production environment reviewer to approve."
+
+  deploy:
+    name: deploy
+    needs: gatekeeper
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # THIS is the human gate. GitHub suspends the job here until someone on the
+    # production environment's required-reviewers list approves it.
+    #
+    # The reviewer list, the wait timer and the branch policy are repository
+    # settings and cannot be set from this file. Run:
+    #   ./scripts/setup-environments.sh <owner/repo> <reviewer[,reviewer...]>
+    #
+    # If the environment does not exist, or has no required reviewers, this job
+    # runs IMMEDIATELY with no approval. An unconfigured environment is not a
+    # gate - verify it with the script's --check mode.
+    environment:
+      name: production
+      # Replace with the real production URL. It shows on the deployment record
+      # and on the PR timeline.
+      url: https://example.invalid
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Deploy exactly what the gatekeeper approved, not whatever main has
+          # become while the approval was pending.
+          ref: ${{ needs.gatekeeper.outputs.sha }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      # ------------------------------------------------------------ DEPLOY
+      # Replace this with the real deployment. Keep it as the only step that
+      # touches production, so the blast radius is one obvious place.
+      #
+      # Whatever goes here must be idempotent: an approval can be granted late,
+      # a run can be re-run, and the same SHA can arrive twice.
+      - name: Deploy
+        run: |
+          set -euo pipefail
+          echo "=== PLACEHOLDER ==="
+          echo "Deploying ${{ needs.gatekeeper.outputs.sha }} to production."
+          echo "Replace this step with the real deployment command."
+          echo "==================="
+
+      - name: Record the deployment
+        if: always()
+        run: |
+          {
+            echo "## Deployed \`${{ needs.gatekeeper.outputs.short }}\`"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Commit | \`${{ needs.gatekeeper.outputs.sha }}\` |"
+            echo "| Approved run | ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }} |"
+            echo "| Result | ${{ job.status }} |"
+            echo
+            echo "To roll back: re-run this workflow with \`sha\` set to the previous"
+            echo "known-good commit. It goes through the same gate and the same approval."
+          } >> "$GITHUB_STEP_SUMMARY"

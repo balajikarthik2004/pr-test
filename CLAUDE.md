@@ -36,6 +36,9 @@ them are green, there is 1 approval, and every review conversation is resolved.
 | `.github/workflows/codeql.yml` | `analyze` | CodeQL when repo variable `HAS_ADVANCED_SECURITY=true`; otherwise a no-op that reports green |
 | `.github/workflows/ai-review.yml` | `ai-review` | Claude review. **Advisory, not a required check** |
 | `.github/workflows/promote.yml` | manual | Opens or updates the `dev→test` / `test→main` PR with release notes. Never merges |
+| `.github/workflows/deploy-production.yml` | `gatekeeper` | Machine preconditions for a production deploy: freeze check, provenance (nothing reaches prod that was never on `test`), required checks green on that exact SHA, and a change manifest for the approver. **Not a PR check** |
+| | `deploy` | Declares `environment: production`, so GitHub suspends it until a required reviewer approves. Deploys the exact SHA the gatekeeper cleared |
+| `scripts/setup-environments.sh` | GitHub settings | Creates the `production` environment with required reviewers, `prevent_self_review` and a protected-branches policy. `--check` verifies the gate is really on |
 | `.github/review-guide.md` | AI policy | What Claude looks for, in priority order, plus the hard rules |
 | `.github/pull_request_template.md` | template | Pre-fills the four sections `description` checks for |
 | `.github/CODEOWNERS` | reviewers | Enforced only in `prod` protection mode |
@@ -86,6 +89,50 @@ Modes: `solo` = 0 approvals (for a single-account sandbox only), `team` = 1 appr
   in-flight run.
 - It gates through **conversation resolution**, not a status check. Every comment must
   be resolved or answered before merge.
+
+## Production deployment gatekeeper
+
+`deploy-production.yml` runs on every push to `main`, and manually via
+`workflow_dispatch`. It is **not** a PR check and is not in the required-checks list.
+
+Two layers, and both are needed:
+
+**1. `gatekeeper` — the machine preconditions.** Runs first and refuses to even
+*request* approval for a commit that should not ship:
+
+- **Deploy freeze.** Blocked while the repo variable `DEPLOY_FREEZE=true`. There is no
+  override input on purpose: lifting the freeze leaves a record of who lifted it.
+- **Provenance.** Every non-merge commit being deployed must be reachable from
+  `origin/test`. A `test → main` merge commit is itself not on `test`, which is why
+  the check uses `--no-merges` — without it every legitimate promotion would be
+  blocked. This is what stops a hotfix pushed straight to `main` reaching production.
+  Overridable with the `allow_untested` input, which **requires** a reason.
+- **Required checks green on that exact SHA** (`verify`, `security`), read from the
+  commit's check runs — not from whatever passed on some other commit.
+- **Change manifest.** Diffs against the last *successful* production deployment and
+  writes the commit list, file stat and an approver checklist to the run summary, so
+  the person approving can see what they are approving.
+
+**2. `deploy` — the human gate.** It declares `environment: production`. GitHub
+suspends the job until someone on that environment's required-reviewers list approves.
+
+> **An unconfigured environment is not a gate.** If the `production` environment does
+> not exist, or has no required reviewers, the deploy job runs immediately and approves
+> nothing — while the YAML still reads `environment: production`. Always finish with
+> `./scripts/setup-environments.sh <owner/repo> --check`.
+
+Other properties worth keeping:
+
+- `concurrency: cancel-in-progress: false`. A half-applied deploy must never be
+  cancelled by the next push, and a run waiting on approval must not be discarded
+  because someone merged again. Runs queue.
+- The deploy job checks out `needs.gatekeeper.outputs.sha`, not `main`. Approval can
+  sit pending for hours; it must ship what was reviewed, not what `main` became.
+- **Rollback is the same path.** Re-run the workflow with `sha` set to the previous
+  known-good commit. It goes through the same gate and the same approval — there is no
+  separate un-gated rollback route.
+- The `Deploy` step is a placeholder. Keep the real deployment as the only step that
+  touches production, and make it idempotent: the same SHA can arrive twice.
 
 ## Invariants: do not break these
 
@@ -152,6 +199,15 @@ gh workflow run promote.yml -f hop=dev-to-test   # open the QA promotion PR
 gh workflow run promote.yml -f hop=test-to-main  # open the release PR after QA passes
 gh pr checks --watch                             # watch a PR's checks
 ./scripts/seed-test-pr.sh <bugs|lint|hygiene|huge|clean>
+
+# production deployment gatekeeper
+./scripts/setup-environments.sh <owner/repo> alice,bob   # configure approvers
+./scripts/setup-environments.sh <owner/repo> --check     # verify the gate is really on
+gh workflow run deploy-production.yml                     # deploy current main
+gh workflow run deploy-production.yml -f sha=<sha> -f reason='rollback to last good'
+gh variable set DEPLOY_FREEZE --body true --repo <owner/repo>   # freeze production
+gh variable delete DEPLOY_FREEZE --repo <owner/repo>            # lift the freeze
+gh run watch                                              # watch the deploy / approval
 ```
 
 ## Known gaps
@@ -164,7 +220,16 @@ gh pr checks --watch                             # watch a PR's checks
   requirements". Use `prod` mode to enforce the rules on admins.
 - GitHub enforces "1 approval" but not *which* person approves. To require the tester
   on `test → main`, use `prod` mode with the QA team in CODEOWNERS, or a GitHub
-  Environment with required reviewers.
+  Environment with required reviewers. **For production deploys this is now closed** —
+  see the gatekeeper section above. It is still open for the `test → main` *merge*
+  itself.
+- **Required reviewers on a private repo need GitHub Pro / Team / Enterprise.** On a
+  free private repo GitHub accepts the environment and silently drops the protection
+  rules, so the deploy job never pauses. `setup-environments.sh --check` reports this;
+  nothing in the workflow file can.
+- `prevent_self_review` means a single-reviewer setup cannot approve its own deploys.
+  That is correct, and it makes a one-person sandbox awkward — use two reviewers, or
+  trigger from a different account.
 
 ## Windows notes
 
