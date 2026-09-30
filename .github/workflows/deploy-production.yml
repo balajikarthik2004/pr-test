@@ -174,7 +174,16 @@ jobs:
 
       # ------------------------------------------------------------ CI status
       # Approval must not be requested for a commit whose own CI never passed.
-      # Checks the conclusions recorded against this exact SHA.
+      #
+      # This POLLS rather than reading once. ci.yml and this workflow both fire
+      # on `push: main`, so they start at the same moment - reading check-runs
+      # immediately would find `verify` still queued and block every legitimate
+      # deploy. Wait for each required check to reach a conclusion, then assert
+      # it is `success`.
+      #
+      # A check that never appears at all (e.g. ci.yml was not triggered for
+      # this commit) times out and blocks, which is the right answer: we cannot
+      # prove CI passed.
       - name: Required checks passed on this commit
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -185,30 +194,58 @@ jobs:
           # Job names from ci.yml. Keep in step with the CHECKS list in
           # scripts/setup-branch-protection.sh.
           REQUIRED="verify security"
+          TIMEOUT_SECONDS=900   # 15 minutes; ci.yml's own jobs cap at 15
+          INTERVAL=20
+          WAITED=0
 
-          RUNS=$(gh api "repos/${REPO}/commits/${SHA}/check-runs" --paginate \
-                   --jq '.check_runs[] | "\(.name)=\(.conclusion)"' || true)
-          echo "Check runs on ${SHA}:"
-          printf '%s\n' "$RUNS" | sed 's/^/  /'
+          while :; do
+            RUNS=$(gh api "repos/${REPO}/commits/${SHA}/check-runs?per_page=100" --paginate \
+                     --jq '.check_runs[] | "\(.name)=\(.status):\(.conclusion // "none")"' 2>/dev/null || true)
 
-          MISSING=""
-          for name in $REQUIRED; do
-            CONCL=$(printf '%s\n' "$RUNS" | { grep "^${name}=" || true; } | head -1 | cut -d= -f2)
-            if [ "$CONCL" != "success" ]; then
-              MISSING="${MISSING} ${name}(${CONCL:-missing})"
+            PENDING=""
+            FAILED=""
+            for name in $REQUIRED; do
+              ENTRY=$(printf '%s\n' "$RUNS" | { grep "^${name}=" || true; } | head -1)
+              STATUS="${ENTRY#*=}"; STATUS="${STATUS%%:*}"
+              CONCL="${ENTRY##*:}"
+              if [ -z "$ENTRY" ] || [ "$STATUS" != "completed" ]; then
+                PENDING="${PENDING} ${name}(${STATUS:-absent})"
+              elif [ "$CONCL" != "success" ]; then
+                FAILED="${FAILED} ${name}(${CONCL})"
+              fi
+            done
+
+            if [ -n "$FAILED" ]; then
+              echo "::error::Required checks failed on ${SHA}:${FAILED}"
+              {
+                echo "## Deploy blocked: CI did not pass on this commit"
+                echo
+                echo "Not green on \`${SHA}\`:${FAILED}"
+              } >> "$GITHUB_STEP_SUMMARY"
+              exit 1
             fi
-          done
 
-          if [ -n "$MISSING" ]; then
-            echo "::error::Required checks did not pass on ${SHA}:${MISSING}"
-            {
-              echo "## Deploy blocked: CI did not pass on this commit"
-              echo
-              echo "Not green on \`${SHA}\`:${MISSING}"
-            } >> "$GITHUB_STEP_SUMMARY"
-            exit 1
-          fi
-          echo "All required checks are green on this commit."
+            if [ -z "$PENDING" ]; then
+              echo "All required checks are green on this commit."
+              break
+            fi
+
+            if [ "$WAITED" -ge "$TIMEOUT_SECONDS" ]; then
+              echo "::error::Timed out after ${WAITED}s waiting for:${PENDING}"
+              {
+                echo "## Deploy blocked: CI never completed"
+                echo
+                echo "Still not concluded on \`${SHA}\` after ${WAITED}s:${PENDING}"
+                echo
+                echo "If ci.yml did not run for this commit, there is no evidence it is safe to ship."
+              } >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+            fi
+
+            echo "Waiting for:${PENDING}  (${WAITED}s elapsed)"
+            sleep "$INTERVAL"
+            WAITED=$((WAITED + INTERVAL))
+          done
 
       # -------------------------------------------------------- what is new
       # The approver needs to see what they are approving. Diffs against the
